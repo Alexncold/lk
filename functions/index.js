@@ -3,7 +3,7 @@ const logger = require("firebase-functions/logger");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
-const pdfParse = require("pdf-parse");
+const { PdfReader } = require("pdfreader");
 
 const app = express();
 const upload = multer({
@@ -13,31 +13,49 @@ const upload = multer({
 
 app.use(cors({ origin: true }));
 
-function buildTableFromText(text) {
-  const lines = text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, 200);
+function extractTableByColumns(buffer) {
+  return new Promise((resolve, reject) => {
+    const COLS = [
+      { name: "Rg", x0: 0, x1: 1.4 },
+      { name: "Codigo", x0: 1.4, x1: 2.4 },
+      { name: "Descripcion", x0: 2.4, x1: 5.6 },
+      { name: "Cant", x0: 5.6, x1: 6.8 },
+      { name: "PUnit", x0: 6.8, x1: 8.4 },
+      { name: "Total", x0: 8.4, x1: 99 },
+    ];
 
-  const parsedRows = lines.map((line) => line.split(/\s{2,}|\t+/).filter(Boolean));
-  const maxColumns = parsedRows.reduce((max, row) => Math.max(max, row.length), 0);
+    const lineMap = {};
 
-  if (!maxColumns) {
-    return { columns: [], rows: [] };
-  }
+    new PdfReader().parseBuffer(buffer, (err, item) => {
+      if (err) return reject(err);
 
-  const columns = Array.from({ length: maxColumns }, (_, index) => `Columna ${index + 1}`);
+      if (!item) {
+        const rows = Object.keys(lineMap)
+          .sort((a, b) => parseFloat(a) - parseFloat(b))
+          .map((y) => {
+            const row = {};
+            COLS.forEach((c) => {
+              row[c.name] = (lineMap[y][c.name] || []).join(" ");
+            });
+            return row;
+          })
+          .filter((row) => row.Rg || row.Codigo);
 
-  const rows = parsedRows.map((rawRow) => {
-    const row = {};
-    columns.forEach((column, index) => {
-      row[column] = rawRow[index] || "";
+        return resolve({ columns: COLS.map((c) => c.name), rows });
+      }
+
+      if (!item.text) return;
+
+      const y = item.y.toFixed(2);
+      const x = item.x;
+      const col = COLS.find((c) => x >= c.x0 && x < c.x1);
+      if (!col) return;
+
+      if (!lineMap[y]) lineMap[y] = {};
+      if (!lineMap[y][col.name]) lineMap[y][col.name] = [];
+      lineMap[y][col.name].push(item.text);
     });
-    return row;
   });
-
-  return { columns, rows };
 }
 
 app.post("/parse-pdf", upload.single("pdf"), async (req, res) => {
@@ -50,8 +68,7 @@ app.post("/parse-pdf", upload.single("pdf"), async (req, res) => {
       return res.status(400).json({ error: "El archivo debe ser un PDF valido." });
     }
 
-    const parsed = await pdfParse(req.file.buffer);
-    const table = buildTableFromText(parsed.text || "");
+    const table = await extractTableByColumns(req.file.buffer);
 
     if (!table.columns.length) {
       return res.status(422).json({ error: "No se detectaron tablas o texto util en el PDF." });
